@@ -1,32 +1,58 @@
+/**
+ * @file main.c
+ * @brief GRBL status LED indicator for ATtiny412 + NeoPixel.
+ *
+ * Parses FluidNC/GRBL status messages from USART0 and drives a small
+ * RGB LED chain (NeoPixel) to visualize the current machine state.
+ *
+ * - Before a "[MSG:INFO: Connected" message is received, the LED blinks
+ *   red <-> purple to indicate waiting-for-boot.
+ * - After BOOTED, the LED color reflects current GRBL status (Idle, Run, etc.).
+ * - If no status update is seen for a while, periodically requests status ("?\n").
+ *
+ * @note MCU: ATtiny412 (AVR-0/1 series)
+ * @note LED: WS2812-compatible on PA3 (alternate USART on PA1/PA2)
+ */
+
 #define F_CPU 20000000UL
+
 #ifndef USART0_BAUD_RATE
-#define USART0_BAUD_RATE(BAUD_RATE) ((float)(F_CPU * 64 / (16 * (float)BAUD_RATE)) + 0.5)
+/// @brief Compute USART0.BAUD register value for a desired baud rate.
+#define USART0_BAUD_RATE(BAUD_RATE) ((float)(F_CPU * 64 / (16 * (float)(BAUD_RATE))) + 0.5f)
 #endif
-// #define DEBUG 1
-#include <tinyNeoPixel_Static.h>
+
+//#define DEBUG 1
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+
+#include <tinyNeoPixel_Static.h>  // NeoPixel driver (uses global pixel buffer)
 
 // ================== Hardware / Pins ==================
-#define LED PIN_PA3
-#define TX PIN_PA1  // just for info
-#define RX PIN_PA2  // just for info
-#define BAUDRATE 115200
-#define NUM_LEDS 1
-#define BRIGHTNESS 31
+#define LED        PIN_PA3  ///< NeoPixel data pin.
+#define TX         PIN_PA1  ///< USART TX (info only, pin config is done in uart_init()).
+#define RX         PIN_PA2  ///< USART RX (info only).
+#define BAUDRATE   115200   ///< USART baud rate.
+
+#define NUM_LEDS   2        ///< Number of NeoPixels in the chain.
+#define BRIGHTNESS 31       ///< Global NeoPixel brightness (0..255).
 
 // ================== Colors ==================
-#define COL_RED 0xff0000
-#define COL_ORA 0xff5f00
-#define COL_YEL 0xffcf00
-#define COL_GRN 0x00ff00
-#define COL_CYA 0x007fff
-#define COL_PUR 0xff00ff   // purple
+#define COL_RED 0xff0000u  ///< Red
+#define COL_ORA 0xff5f00u  ///< Orange
+#define COL_YEL 0xffcf00u  ///< Yellow
+#define COL_GRN 0x00ff00u  ///< Green
+#define COL_CYA 0x007fffu  ///< Cyan
+#define COL_PUR 0xff00ffu  ///< Purple (magenta)
 
 // ================== Timings (ms) ==================
-#define BLINK_INTERVAL      250     // startup blink until BOOTED seen
-#define REQUEST_TIMEOUT_MS  5000    // if no status for this long, send "?\n"
-#define STATUS_TIMEOUT_MS   5000    // if still no status, show fallback
+#define BLINK_INTERVAL      250u   ///< Startup blink period before BOOTED is seen.
+#define REQUEST_TIMEOUT_MS  5000u  ///< If no status for this long, send "?\n" to FluidNC.
 
-// ================== GRBL message prefixes ==================
+// ================== GRBL messages to parse ==================
+#define MAX_PARSE_LEN 25  ///< Maximum parsed string length (prefix-only compare).
 #define MSG_BOOTED "[MSG:INFO: Connected"
 #define MSG_IDLE   "<Idle"
 #define MSG_RUN    "<Run"
@@ -34,39 +60,57 @@
 #define MSG_JOG    "<Jog"
 #define MSG_DOOR   "<Door"
 #define MSG_HOME   "<Home"
-#define MSG_ALARM   "<Alarm"
+#define MSG_ALARM  "<Alarm"
 
-
-
-enum Status {
-  BOOTED,
-  IDLE,
-  RUN,
-  HOLD,
-  JOG,
-  DOOR,
-  HOME,
-  ALARM,
-  UNKNOWN = 255
-};
+/**
+ * @enum Status
+ * @brief Parsed GRBL states used to drive the LED.
+ */
+typedef enum Status {
+  BOOTED,   ///< Controller reported boot/connect info.
+  IDLE,     ///< "<Idle"
+  RUN,      ///< "<Run"
+  HOLD,     ///< "<Hold"
+  JOG,      ///< "<Jog"
+  DOOR,     ///< "<Door"
+  HOME,     ///< "<Home"
+  ALARM,    ///< "<Alarm"
+  UNKNOWN = 255 ///< Not parsed or incomplete.
+} Status;
 
 // ================== NeoPixel ==================
 byte pixels[NUM_LEDS * 3];
 tinyNeoPixel leds = tinyNeoPixel(NUM_LEDS, LED, NEO_GRB + NEO_KHZ800, pixels);
 
-// ================== USART0 (register-level) ==================
-void USART0_init()
-{
-  // Route USART0 to ALTERNATE pins (bit 0 = 1)
- 
-  // Set directions for the *alternate* pins
-    PORTMUX.CTRLB |= 1; // |= 1 Alternate, &= 0xfe Default USART pins
-    PORTA.DIR &= ~PIN2_bm; //input (RX)
-    PORTA.DIR |= PIN1_bm; //output (TX) 
-    PORTA.DIR |= PIN3_bm; //output (LED pin) 
+// ================== Forward declarations (Arduino provides prototypes, but Doxygen likes these) ==================
+static void uart_init(void);
+static bool uart_available(void);
+static uint8_t uart_read(void);
+static void uart_write(uint8_t b);
+static void uart_write_str(const char *str);
+static void setColor(uint32_t color);
+static void showStatus(Status st);
+static Status parse_status(void);
 
-  // UART 8N1, async
-  //USART0.CTRLC = USART_CHSIZE_8BIT_gc | USART_SBMODE_1BIT_gc | USART_PMODE_DISABLED_gc;
+#ifdef DEBUG
+static void debugPrint(const char *buf);
+#endif
+
+// ================== USART0 (register-level) ==================
+
+/**
+ * @brief Initialize USART0 on alternate pins PA1 (TX) and PA2 (RX), 8N1, async.
+ *
+ * Configures the port mux for alternate USART pins, sets pin directions,
+ * computes and sets the baud rate, and enables RX/TX.
+ */
+static void uart_init(void) {
+  // Select alternate pins for USART0 (PA1 TX / PA2 RX)
+  PORTMUX.CTRLB |= 1;
+
+  // Directions
+  PORTA.DIR &= ~PIN2_bm;  // RX as input
+  PORTA.DIR |= PIN1_bm;   // TX as output
 
   // Baud
   USART0.BAUD = (uint16_t)USART0_BAUD_RATE(BAUDRATE);
@@ -75,103 +119,168 @@ void USART0_init()
   USART0.CTRLB |= USART_RXEN_bm | USART_TXEN_bm;
 }
 
-// Non-blocking: true if a byte is waiting
-bool uart_available() { return (USART0.STATUS & USART_RXCIF_bm); }
-// Read one byte (call only if available)
-uint8_t uart_read()   { return USART0.RXDATAL; }
-// Write one byte
-void uart_write(uint8_t b) {
-  while (!(USART0.STATUS & USART_DREIF_bm)) { /* wait */ }
-  USART0.TXDATAL = b;
-}
-//void uart_write_str(const char *s) { while (*s) uart_write((uint8_t)*s++); }
-void uart_write_str(const char *str)
-{
-    for(size_t i = 0; i < strlen(str); i++)
-    {
-        uart_write(str[i]);
-    }
+/**
+ * @brief Non-blocking check for a received byte.
+ * @return true if a byte is waiting in RX buffer, false otherwise.
+ */
+static bool uart_available(void) {
+  return (USART0.STATUS & USART_RXCIF_bm);
 }
 
-// ================== LED helpers ==================
-void setColor(uint32_t color) { leds.fill(color, 0, NUM_LEDS); leds.show(); }
-void showStatus(Status st) {
-  switch (st) {
-    case BOOTED: setColor(COL_GRN); break; // also used as fallback
-    case IDLE:   setColor(COL_GRN); break;
-    case RUN:    setColor(COL_CYA); break;
-    case HOLD:   setColor(COL_YEL); break;
-    case JOG:    setColor(COL_PUR); break; 
-    case DOOR:   setColor(COL_ORA); break;
-    case HOME:   setColor(COL_PUR); break;
-    case ALARM:  setColor(COL_RED); break; 
-    default:     break;
+/**
+ * @brief Read one byte from USART0.
+ * @warning Call only if @ref uart_available returned true.
+ * @return The received byte.
+ */
+static uint8_t uart_read(void) {
+  return USART0.RXDATAL;
+}
+
+/**
+ * @brief Write one byte to USART0 (blocking until data register empty).
+ * @param b Byte to transmit.
+ */
+static void uart_write(uint8_t b) {
+  while (!(USART0.STATUS & USART_DREIF_bm)) {
+    /* wait */
+  }
+  USART0.TXDATAL = b;
+}
+
+/**
+ * @brief Write a zero-terminated C string to USART0.
+ * @param str Pointer to a null-terminated string.
+ */
+static void uart_write_str(const char *str) {
+  for (size_t i = 0; i < strlen(str); i++) {
+    uart_write((uint8_t)str[i]);
   }
 }
 
-//==================== Debug print ==================
-void debugPrint(const char *buf){
-        for (uint8_t i = 0; i < 25; i++)
-      {
-        uart_write(buf[i]);
-      }
-      uart_write(' ');
-      char ln[10]; 
-      sprintf(ln, " --- %d", strlen(buf));
-      uart_write_str(ln);
-      uart_write('\n');
+// ================== LED helpers ==================
+
+/**
+ * @brief Set all NeoPixels to a 24-bit RGB color and show.
+ * @param color 24-bit color as 0xRRGGBB.
+ */
+static void setColor(uint32_t color) {
+  leds.fill(color, 0, NUM_LEDS);
+  leds.show();
 }
 
+/**
+ * @brief Display a color corresponding to a parsed GRBL status.
+ * @param st Parsed status value.
+ */
+static void showStatus(Status st) {
+  switch (st) {
+    case BOOTED: setColor(COL_GRN); break;
+    case IDLE:   setColor(COL_GRN); break;
+    case RUN:    setColor(COL_CYA); break;
+    case HOLD:   setColor(COL_YEL); break;
+    case JOG:    setColor(COL_PUR); break;
+    case DOOR:   setColor(COL_ORA); break;
+    case HOME:   setColor(COL_PUR); break;
+    case ALARM:  setColor(COL_RED); break;
+    default:     /* no change */    break;
+  }
+}
+
+// ================== Debug print ==================
+#ifdef DEBUG
+/**
+ * @brief Send the beginning of a received line and its length to TX.
+ * @param buf Null-terminated buffer containing the received line.
+ */
+static void debugPrint(const char *buf) {
+  // Print at most MAX_PARSE_LEN characters to avoid spamming
+  for (uint8_t i = 0; i < (uint8_t)MAX_PARSE_LEN; i++) {
+    if (buf[i] == '\0') break;
+    uart_write((uint8_t)buf[i]);
+  }
+  char ln[16];
+  (void)sprintf(ln, " --- %u", (unsigned)strlen(buf));
+  uart_write_str(ln);
+  uart_write((uint8_t)'\n');
+}
+#endif
+
 // ================== GRBL line parser (non-blocking) ==================
-Status parse_status() {
-  static char lineBuf[40];
+
+/**
+ * @brief Incrementally parse characters from USART into a short line buffer.
+ *
+ * Collects characters until LF (\\n). CR (\\r) is ignored to support CR+LF sources.
+ * Only the beginning of the line is stored (up to @ref MAX_PARSE_LEN - 1),
+ * because matching is done on known message prefixes.
+ *
+ * @return Parsed @ref Status if a recognized message prefix is found
+ *         at end-of-line; otherwise @ref UNKNOWN.
+ */
+static Status parse_status(void) {
+  static char lineBuf[MAX_PARSE_LEN];
   static uint8_t idx = 0;
 
   while (uart_available()) {
     char c = (char)uart_read();
-    //uart_write(c);
-    if (c == '\r') continue;
+    if (c == '\r') {
+      continue;  // skip CR
+    }
 
-    if (c == '\n') {
+    if (c == '\n') {  // end of line
       lineBuf[idx] = '\0';
       idx = 0;
+
       #ifdef DEBUG
       debugPrint(lineBuf);
       #endif
-      if (lineBuf[0] == '\0') return UNKNOWN;
+
+      if (lineBuf[0] == '\0') {
+        return UNKNOWN;
+      }
 
       if (strncmp(lineBuf, MSG_BOOTED, strlen(MSG_BOOTED)) == 0) return BOOTED;
       if (strncmp(lineBuf, MSG_IDLE,   strlen(MSG_IDLE))   == 0) return IDLE;
       if (strncmp(lineBuf, MSG_RUN,    strlen(MSG_RUN))    == 0) return RUN;
       if (strncmp(lineBuf, MSG_HOLD,   strlen(MSG_HOLD))   == 0) return HOLD;
-      if (strncmp(lineBuf, MSG_JOG,    strlen(MSG_JOG))   == 0) return JOG;
+      if (strncmp(lineBuf, MSG_JOG,    strlen(MSG_JOG))    == 0) return JOG;
       if (strncmp(lineBuf, MSG_DOOR,   strlen(MSG_DOOR))   == 0) return DOOR;
       if (strncmp(lineBuf, MSG_HOME,   strlen(MSG_HOME))   == 0) return HOME;
-      if (strncmp(lineBuf, MSG_ALARM,  strlen(MSG_ALARM))   == 0) return ALARM;
+      if (strncmp(lineBuf, MSG_ALARM,  strlen(MSG_ALARM))  == 0) return ALARM;
 
-      return UNKNOWN; // complete line but not matched
+      return UNKNOWN;  // complete line but not matched any message
     }
 
-    if (idx < sizeof(lineBuf) - 1) lineBuf[idx++] = c;
-    //else idx = 0; // overflow -> reset this line
+    // Store only the initial part needed for prefix matching
+    if (idx < (sizeof(lineBuf) - 1u)) {
+      lineBuf[idx++] = c;
+    }
+    // else: silently drop extra chars
   }
 
-  return UNKNOWN; // no full line yet
+  return UNKNOWN;  // no full line yet
 }
 
 // ================== State ==================
-bool seenBooted = false;
-Status lastShown = UNKNOWN;
-uint32_t lastBlinkToggleMs = 0;
-bool blinkPhase = false; // false: red, true: purple
-uint32_t lastKnownStatusMs = 0;
-uint32_t lastRequestMs = 0;
+static bool     seenBooted           = false;
+static Status   lastShown            = UNKNOWN;
+static uint32_t lastBlinkToggleMs    = 0;
+static bool     blinkPhase           = false;  // false: red, true: purple
+static uint32_t lastKnownStatusMs    = 0;
+static uint32_t lastRequestMs        = 0;
 
 // ================== Arduino lifecycle ==================
-void setup() {
-  USART0_init();
 
-  pinMode(LED, OUTPUT);
+/**
+ * @brief Arduino setup: init UART, LED, and start blinking until booted message arrives.
+ */
+void setup(void) {
+  uart_init();
+
+  // LED pin as output
+  PORTA.DIR |= PIN3_bm;
+
+  // NeoPixel init
   leds.begin();
   leds.setBrightness(BRIGHTNESS);
 
@@ -180,52 +289,48 @@ void setup() {
   lastBlinkToggleMs = millis();
 }
 
-void loop() {
+/**
+ * @brief Main loop: parse status, request status periodically, and drive LED.
+ */
+void loop(void) {
   const uint32_t now = millis();
 
   // Parse any incoming line
-  Status st = parse_status();
+  const Status st = parse_status();
 
   if (st != UNKNOWN) {
     if (st == BOOTED) {
-      seenBooted = true;
+      seenBooted        = true;    // connected and ready
       lastKnownStatusMs = now;
-      lastRequestMs = now; // first "?" after REQUEST_TIMEOUT_MS
-      if (st != lastShown) { showStatus(st); lastShown = st; }
-    } else if (seenBooted) { // ODSTRANIT !
+      lastRequestMs     = now;     // first "?\n" after REQUEST_TIMEOUT_MS
+      if (st != lastShown) {
+        showStatus(st);
+        lastShown = st;
+      }
+    } else if (seenBooted) {
       lastKnownStatusMs = now;
-      if (st != lastShown) { showStatus(st); lastShown = st; }
+      if (st != lastShown) {
+        showStatus(st);
+        lastShown = st;
+      }
     }
+    // else: not yet booted; keep blinking logic below
   }
 
-  // BEFORE BOOTED: blink red <-> purple
-    // 1) If no new status for REQUEST_TIMEOUT_MS, ask GRBL for status with "?\n"
-  if ((now - lastKnownStatusMs) >= REQUEST_TIMEOUT_MS &&
-      (now - lastRequestMs)    >= REQUEST_TIMEOUT_MS) {
+  // If no new status for REQUEST_TIMEOUT_MS, ask GRBL for status with "?\n"
+  if (((now - lastKnownStatusMs) >= REQUEST_TIMEOUT_MS) &&
+      ((now - lastRequestMs)    >= REQUEST_TIMEOUT_MS)) {
     uart_write_str("?\n");
     lastRequestMs = now;
   }
 
+  // BEFORE BOOTED: blink red <-> purple
   if (!seenBooted) {
     if ((now - lastBlinkToggleMs) >= BLINK_INTERVAL) {
       blinkPhase = !blinkPhase;
       setColor(blinkPhase ? COL_PUR : COL_RED);
       lastBlinkToggleMs = now;
-      // uart_write_str("?\n");
     }
-    return; // wait for BOOTED
+    return;  // wait for BOOTED
   }
-
-  // AFTER BOOTED:
-
-
-  // 2) If STILL no status for STATUS_TIMEOUT_MS, show fallback (solid red)
-  /*
-  if ((now - lastKnownStatusMs) > STATUS_TIMEOUT_MS) {
-    if (lastShown != BOOTED) {
-      setColor(COL_RED);
-      lastShown = BOOTED;
-    }
-  }
-  */  
 }
